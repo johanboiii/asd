@@ -1,0 +1,306 @@
+# Solver2 — CF turnstile solver on GitHub Actions (windows) + cloudflared tunnel
+#
+# HARD LIMIT: public GH Actions jobs max ~6 hours (timeout-minutes: 350).
+# Each run gets a NEW trycloudflare.com URL — your bot must be updated.
+#
+# This workflow:
+#   1) runs solver + wrapper + tunnel (auto-restart inside the job)
+#   2) on every new tunnel URL:
+#        - prints ENDPOINT clearly in logs
+#        - optional: POSTs URL to Railway TURNSTILE_SOLVER + restarts bot
+#        - optional: commits current_solver.txt for SOLVER_DISCOVERY_URL
+#   3) schedule restarts every 5h (cancels previous run)
+#
+# Repo secrets (Settings → Secrets → Actions):
+#   RAILWAY_TOKEN          account or project token
+#   RAILWAY_PROJECT_ID     e.g. 19f82561-f85d-4c23-a5b3-848fcd041eeb
+#   RAILWAY_ENV_ID         e.g. 8c9dfa3d-bbc7-4ea5-9072-c2695db3f04d
+#   RAILWAY_SERVICE_ID     e.g. 771fec73-0710-4e59-91dd-15f2eb7f1c52
+#   TELEGRAM_BOT_TOKEN     (optional) notify you of new URL
+#   TELEGRAM_CHAT_ID       (optional) your telegram id
+#
+# Bot: set SOLVER_DISCOVERY_URL=https://raw.githubusercontent.com/<user>/<repo>/main/current_solver.txt
+#  or use Railway var auto-update below.
+
+name: "Solver2 (6h + auto URL publish)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      CODE:
+        description: "CRD Code (optional manual remote desktop)"
+        required: false
+        default: ""
+      PIN:
+        description: "CRD PIN"
+        required: false
+        default: "123456"
+      DROPBOX_URL:
+        description: "i.exe download URL (blank = default)"
+        required: false
+        default: ""
+      PORT:
+        description: "Public wrapper port"
+        required: false
+        default: "8742"
+      PUBLISH_RAILWAY:
+        description: "Push new URL to Railway + redeploy bot (true/false)"
+        required: false
+        default: "true"
+      PUBLISH_GIT:
+        description: "Commit current_solver.txt to this repo (true/false)"
+        required: false
+        default: "true"
+  # re-fire before the 6h hard kill so a fresh tunnel is always available
+  schedule:
+    - cron: "0 */5 * * *"   # every 5 hours UTC
+
+concurrency:
+  group: solver2-singleton
+  cancel-in-progress: true   # kill previous 6h job when a new one starts
+
+jobs:
+  solver:
+    runs-on: windows-latest
+    timeout-minutes: 350   # GH free/public max ~360; leave margin
+
+    permissions:
+      contents: write   # for current_solver.txt commit
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Setup CRD (optional)"
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.CODE != '' }}
+        shell: pwsh
+        env:
+          RAW_INPUT_CODE: ${{ github.event.inputs.CODE }}
+          INPUT_PIN: ${{ github.event.inputs.PIN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inputCode = $env:RAW_INPUT_CODE
+          $pin = $env:INPUT_PIN
+          Write-Host "::add-mask::$inputCode"
+          Write-Host "::add-mask::$pin"
+          if ($inputCode -match '4/[A-Za-z0-9_\-\.\~]+') { $token = $Matches[0] }
+          else { $token = $inputCode.Trim().Trim("'").Trim('"') }
+          Write-Host "::add-mask::$token"
+          $msiPath = "$env:TEMP\crd.msi"
+          Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msiPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait
+          $paths = @(
+            "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe",
+            "${env:ProgramFiles}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          )
+          $exe = $null
+          foreach ($p in $paths) { if (Test-Path $p) { $exe = $p; break } }
+          if (-not $exe) { throw "CRD executable not found" }
+          $name = "Runner-$($env:GITHUB_RUN_ID)"
+          $proc = Start-Process -FilePath $exe `
+            -ArgumentList "--code=`"$token`"", "--redirect-url=`"https://remotedesktop.google.com/_/oauthredirect`"", "--name=`"$name`"", "--pin=`"$pin`"" `
+            -PassThru -Wait -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "CRD failed $($proc.ExitCode)" }
+
+      - name: "Download i.exe"
+        shell: pwsh
+        env:
+          DROPBOX_URL: ${{ github.event.inputs.DROPBOX_URL }}
+        run: |
+          $defaultUrl = "https://www.dropbox.com/scl/fi/ckwstjsl5m24nfx0al2l8/i.exe?rlkey=9pyceu1cwd8lkrtbqfk2lb8sf&st=5afwppz7&dl=1"
+          $url = if ($env:DROPBOX_URL -and $env:DROPBOX_URL.Trim()) { $env:DROPBOX_URL.Trim() } else { $defaultUrl }
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile "i.exe" -UseBasicParsing
+              Write-Host "i.exe $([math]::Round((Get-Item i.exe).Length/1MB,2)) MB"
+              break
+            } catch {
+              if ($i -eq 3) { throw $_ }
+              Start-Sleep 5
+            }
+          }
+
+      - name: "Download cloudflared"
+        shell: pwsh
+        run: |
+          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile "cloudflared.exe" -UseBasicParsing
+              break
+            } catch {
+              if ($i -eq 3) { throw $_ }
+              Start-Sleep 5
+            }
+          }
+
+      - name: "Run Solver + Tunnel (publish URL on each restart)"
+        shell: pwsh
+        env:
+          INPUT_PORT: ${{ github.event.inputs.PORT || '8742' }}
+          PUBLISH_RAILWAY: ${{ github.event.inputs.PUBLISH_RAILWAY || 'true' }}
+          PUBLISH_GIT: ${{ github.event.inputs.PUBLISH_GIT || 'true' }}
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+          RAILWAY_ENV_ID: ${{ secrets.RAILWAY_ENV_ID }}
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          $PORT = if ($env:INPUT_PORT) { [int]$env:INPUT_PORT } else { 8742 }
+          $SOLVER_PORT = $PORT + 1
+          $restarts = 0
+          $solverProc = $null
+          $wrapperProc = $null
+          $lastPublished = ""
+
+          function Start-Iexe {
+            Write-Host "Starting i.exe on $SOLVER_PORT"
+            return (Start-Process cmd.exe -ArgumentList "/c", "echo $SOLVER_PORT| .\i.exe >> solver.log 2>&1" -PassThru -NoNewWindow)
+          }
+          function Start-Wrapper {
+            Write-Host "Starting wrapper.py $PORT -> $SOLVER_PORT"
+            return (Start-Process python -ArgumentList "wrapper.py", "$PORT", "$SOLVER_PORT" -PassThru -NoNewWindow -RedirectStandardOutput wrapper.log -RedirectStandardError wrapper_err.log)
+          }
+          function Start-Tunnel {
+            $logFile = "tunnel_$(Get-Date -Format 'HHmmss').log"
+            $proc = Start-Process ".\cloudflared.exe" -ArgumentList "tunnel","--url","http://localhost:$PORT" -RedirectStandardError $logFile -PassThru -NoNewWindow
+            $url = $null
+            for ($w = 0; $w -lt 45 -and -not $url; $w++) {
+              Start-Sleep 1
+              $c = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+              if ($c -match 'https://[a-z0-9\-]+\.trycloudflare\.com') { $url = $Matches[0] }
+            }
+            return @{ proc = $proc; url = $url; log = $logFile }
+          }
+
+          function Publish-SolverUrl([string]$tunnelBase) {
+            if (-not $tunnelBase) { return }
+            $endpoint = "$tunnelBase/cloudflare"
+            if ($endpoint -eq $script:lastPublished) {
+              Write-Host "URL unchanged, skip publish"
+              return
+            }
+            $script:lastPublished = $endpoint
+            Write-Host "======================================================"
+            Write-Host "TUNNEL URL   : $tunnelBase"
+            Write-Host "ENDPOINT     : $endpoint"
+            Write-Host "DASHBOARD    : $tunnelBase/"
+            Write-Host "======================================================"
+            # GitHub Actions annotation (searchable in UI)
+            Write-Host "::notice title=Solver endpoint::$endpoint"
+
+            # 1) commit discovery file for SOLVER_DISCOVERY_URL
+            if ($env:PUBLISH_GIT -ne "false") {
+              try {
+                $endpoint | Out-File -Encoding ascii -FilePath current_solver.txt -NoNewline
+                git config user.name "solver2-bot"
+                git config user.email "solver2@users.noreply.github.com"
+                git add current_solver.txt
+                git diff --cached --quiet
+                if ($LASTEXITCODE -ne 0) {
+                  git commit -m "chore: solver url $(Get-Date -Format o)"
+                  git push origin HEAD:main 2>&1 | ForEach-Object { Write-Host $_ }
+                  Write-Host "Published current_solver.txt"
+                }
+              } catch {
+                Write-Host "WARN git publish failed: $_"
+              }
+            }
+
+            # 2) Railway env + redeploy
+            if ($env:PUBLISH_RAILWAY -ne "false" -and $env:RAILWAY_TOKEN -and $env:RAILWAY_PROJECT_ID) {
+              try {
+                $body = @{
+                  query = 'mutation($input: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $input) }'
+                  variables = @{
+                    input = @{
+                      projectId = $env:RAILWAY_PROJECT_ID
+                      environmentId = $env:RAILWAY_ENV_ID
+                      serviceId = $env:RAILWAY_SERVICE_ID
+                      skipDeploys = $false
+                      variables = @{
+                        TURNSTILE_SOLVER = $endpoint
+                      }
+                    }
+                  }
+                } | ConvertTo-Json -Depth 8
+                $headers = @{
+                  Authorization = "Bearer $($env:RAILWAY_TOKEN)"
+                  "Content-Type" = "application/json"
+                  "User-Agent" = "Solver2-GH/1.0"
+                }
+                $r = Invoke-RestMethod -Uri "https://backboard.railway.app/graphql/v2" -Method POST -Headers $headers -Body $body
+                Write-Host "Railway var upsert: $($r | ConvertTo-Json -Compress)"
+                # force restart so process picks up env (bot also reads discovery file)
+                $redeploy = @{
+                  query = "mutation { serviceInstanceRedeploy(serviceId: `"$($env:RAILWAY_SERVICE_ID)`", environmentId: `"$($env:RAILWAY_ENV_ID)`") }"
+                } | ConvertTo-Json
+                $r2 = Invoke-RestMethod -Uri "https://backboard.railway.app/graphql/v2" -Method POST -Headers $headers -Body $redeploy
+                Write-Host "Railway redeploy: $($r2 | ConvertTo-Json -Compress)"
+              } catch {
+                Write-Host "WARN Railway publish failed: $_"
+              }
+            }
+
+            # 3) Telegram ping
+            if ($env:TELEGRAM_BOT_TOKEN -and $env:TELEGRAM_CHAT_ID) {
+              try {
+                $msg = "🔧 Solver2 new tunnel`n$endpoint`n(job runs max ~6h)"
+                $tg = "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage"
+                Invoke-RestMethod -Uri $tg -Method POST -Body @{ chat_id = $env:TELEGRAM_CHAT_ID; text = $msg } | Out-Null
+              } catch {
+                Write-Host "WARN telegram notify failed: $_"
+              }
+            }
+          }
+
+          $solverProc = Start-Iexe
+          Write-Host "Waiting 15s for i.exe..."
+          Start-Sleep 15
+          Get-Content solver.log -Tail 8 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [i.exe] $_" }
+          $wrapperProc = Start-Wrapper
+          Start-Sleep 5
+
+          while ($true) {
+            Write-Host "Starting tunnel (restart #$restarts)..."
+            if ($solverProc.HasExited) {
+              Write-Host "i.exe dead — restart"
+              $solverProc = Start-Iexe; Start-Sleep 15
+            }
+            if ($wrapperProc.HasExited) {
+              Write-Host "wrapper dead — restart"
+              $wrapperProc = Start-Wrapper; Start-Sleep 5
+            }
+
+            $tunnel = Start-Tunnel
+            Publish-SolverUrl $tunnel.url
+
+            while (-not $tunnel.proc.HasExited) {
+              Start-Sleep 15
+              $ts = Get-Date -Format "HH:mm:ss"
+              Write-Host "$ts | tunnel=$(-not $tunnel.proc.HasExited) | i.exe=$(-not $solverProc.HasExited) | wrapper=$(-not $wrapperProc.HasExited)"
+
+              if ($solverProc.HasExited) {
+                try { Stop-Process -Id $tunnel.proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                try { Stop-Process -Id $wrapperProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                $solverProc = Start-Iexe; Start-Sleep 15
+                $wrapperProc = Start-Wrapper
+                break
+              }
+              if ($wrapperProc.HasExited) {
+                try { Stop-Process -Id $tunnel.proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                $wrapperProc = Start-Wrapper
+                break
+              }
+              if ($tunnel.url -and ((Get-Date).Minute % 5 -eq 0) -and ((Get-Date).Second -lt 20)) {
+                Write-Host "ENDPOINT : $($tunnel.url)/cloudflare"
+              }
+            }
+            $restarts++
+            Write-Host "Tunnel exited — restart in 5s (#$restarts)"
+            Start-Sleep 5
+          }
