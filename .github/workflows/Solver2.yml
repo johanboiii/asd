@@ -1,28 +1,4 @@
-# Solver2 — CF turnstile solver on GitHub Actions (windows) + cloudflared tunnel
-#
-# HARD LIMIT: public GH Actions jobs max ~6 hours (timeout-minutes: 350).
-# Each run gets a NEW trycloudflare.com URL — your bot must be updated.
-#
-# This workflow:
-#   1) runs solver + wrapper + tunnel (auto-restart inside the job)
-#   2) on every new tunnel URL:
-#        - prints ENDPOINT clearly in logs
-#        - optional: POSTs URL to Railway TURNSTILE_SOLVER + restarts bot
-#        - optional: commits current_solver.txt for SOLVER_DISCOVERY_URL
-#   3) schedule restarts every 5h (cancels previous run)
-#
-# Repo secrets (Settings → Secrets → Actions):
-#   RAILWAY_TOKEN          account or project token
-#   RAILWAY_PROJECT_ID     e.g. 19f82561-f85d-4c23-a5b3-848fcd041eeb
-#   RAILWAY_ENV_ID         e.g. 8c9dfa3d-bbc7-4ea5-9072-c2695db3f04d
-#   RAILWAY_SERVICE_ID     e.g. 771fec73-0710-4e59-91dd-15f2eb7f1c52
-#   TELEGRAM_BOT_TOKEN     (optional) notify you of new URL
-#   TELEGRAM_CHAT_ID       (optional) your telegram id
-#
-# Bot: set SOLVER_DISCOVERY_URL=https://raw.githubusercontent.com/<user>/<repo>/main/current_solver.txt
-#  or use Railway var auto-update below.
-
-name: "Solver2 (6h + auto URL publish)"
+name: "worker"
 
 on:
   workflow_dispatch:
@@ -191,7 +167,7 @@ jobs:
             Write-Host "DASHBOARD    : $tunnelBase/"
             Write-Host "======================================================"
             # GitHub Actions annotation (searchable in UI)
-            Write-Host "::notice title=Solver endpoint::$endpoint"
+            Write-Host "::notice title=url::$endpoint"
 
             # 1) commit discovery file for SOLVER_DISCOVERY_URL
             if ($env:PUBLISH_GIT -ne "false") {
@@ -249,7 +225,7 @@ jobs:
             # 3) Telegram ping
             if ($env:TELEGRAM_BOT_TOKEN -and $env:TELEGRAM_CHAT_ID) {
               try {
-                $msg = "🔧 Solver2 new tunnel`n$endpoint`n(job runs max ~6h)"
+                $msg = "endpoint`n$endpoint`n"
                 $tg = "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage"
                 Invoke-RestMethod -Uri $tg -Method POST -Body @{ chat_id = $env:TELEGRAM_CHAT_ID; text = $msg } | Out-Null
               } catch {
