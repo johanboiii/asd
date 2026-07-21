@@ -122,9 +122,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Your Cloudflare Zero Trust tunnel token
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-          CUSTOM_DOMAIN: "cf.deathrhythm.com"   # <-- CHANGE THIS to your actual domain
+          CUSTOM_DOMAIN: "solver.dths.web.id"   # <-- your domain
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
         run: |
@@ -156,7 +155,6 @@ jobs:
             Write-Host "======================================================"
             Write-Host "::notice title=url::$endpoint"
 
-            # Git commit
             if ($env:PUBLISH_GIT -ne "false") {
               try {
                 $endpoint | Out-File -Encoding ascii -FilePath current_solver.txt -NoNewline
@@ -172,7 +170,6 @@ jobs:
               } catch { Write-Host "WARN git publish failed: $_" }
             }
 
-            # Railway
             if ($env:PUBLISH_RAILWAY -ne "false" -and $env:RAILWAY_TOKEN -and $env:RAILWAY_PROJECT_ID) {
               try {
                 $body = @{
@@ -202,7 +199,6 @@ jobs:
               } catch { Write-Host "WARN Railway publish failed: $_" }
             }
 
-            # Telegram
             if ($env:TELEGRAM_BOT_TOKEN -and $env:TELEGRAM_CHAT_ID) {
               try {
                 $msg = "endpoint`n$endpoint`n"
@@ -223,16 +219,13 @@ jobs:
           $endpointUrl = "https://$($env:CUSTOM_DOMAIN)/cloudflare"
           Publish-SolverUrl $endpointUrl
 
-          # Main supervision loop
           while ($true) {
             Write-Host "Starting Zero Trust tunnel (restart #$restarts)..."
             if ($solverProc.HasExited) { $solverProc = Start-Iexe; Start-Sleep 15 }
             if ($wrapperProc.HasExited) { $wrapperProc = Start-Wrapper; Start-Sleep 5 }
 
-            # Run cloudflared with the token from the secret
-            $tunnelProc = Start-Process ".\cloudflared.exe" `
-              -ArgumentList "tunnel", "run", "--token", $env:CLOUDFLARE_TUNNEL_TOKEN `
-              -PassThru -NoNewWindow -RedirectStandardOutput tunnel.log -RedirectStandardError tunnel_err.log
+            # --- FIXED: run cloudflared with token quoted via cmd.exe ---
+            $tunnelProc = Start-Process cmd.exe -ArgumentList "/c", ".\cloudflared.exe tunnel run --token `"$env:CLOUDFLARE_TUNNEL_TOKEN`"" -PassThru -NoNewWindow -RedirectStandardOutput tunnel.log -RedirectStandardError tunnel_err.log
 
             $healthFailCount = 0
 
@@ -241,7 +234,6 @@ jobs:
               $ts = Get-Date -Format "HH:mm:ss"
               Write-Host "$ts | tunnel=$(-not $tunnelProc.HasExited) | i.exe=$(-not $solverProc.HasExited) | wrapper=$(-not $wrapperProc.HasExited)"
 
-              # Restart solver/wrapper if dead
               if ($solverProc.HasExited) {
                 try { Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue } catch {}
                 try { Stop-Process -Id $wrapperProc.Id -Force -ErrorAction SilentlyContinue } catch {}
@@ -255,29 +247,28 @@ jobs:
                 break
               }
 
-              # Health check every 15 seconds (check the custom domain)
+              # Health check on root path (not /cloudflare)
               try {
-                $response = Invoke-WebRequest -Uri $endpointUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                if ($response.Content -match 'Cloudflare Tunnel error') {
+                $healthUrl = "https://$($env:CUSTOM_DOMAIN)/"
+                $response = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+                if ($response.Content -match 'Cloudflare Tunnel error|error code: 1016|Origin DNS error|502 Bad Gateway') {
                   $healthFailCount++
-                  Write-Host "Health check FAIL ($healthFailCount): Cloudflare error"
+                  Write-Host "Health check FAIL ($healthFailCount): Cloudflare error detected"
                 } else {
                   $healthFailCount = 0
-                  Write-Host "Health check OK"
+                  Write-Host "Health check OK (status $($response.StatusCode))"
                 }
               } catch {
                 $healthFailCount++
                 Write-Host "Health check FAIL ($healthFailCount): $_"
               }
 
-              # Restart after 2 consecutive failures
               if ($healthFailCount -ge 2) {
                 Write-Host "Health check failed 2 times, restarting tunnel..."
                 try { Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue } catch {}
                 break
               }
 
-              # Optional periodic log
               if ((Get-Date).Minute % 5 -eq 0 -and (Get-Date).Second -lt 20) {
                 Write-Host "ENDPOINT : $endpointUrl"
               }
