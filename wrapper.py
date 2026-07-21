@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CF Solver Wrapper -- By 0.P aka @NUGHAboli
+CF Turnstile Bypass -- By KNTL.
 
 Proxies /cloudflare to i.exe (managed externally by the YAML),
 tracks solve stats, and serves a live dashboard at /.
@@ -23,8 +23,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import deque
 from datetime import datetime
 
-AUTHOR  = "0.P aka @NUGHAboli"
-VERSION = "2.1.0"
+AUTHOR  = "KNTL."
+VERSION = "6.9"
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _lock  = threading.Lock()
@@ -108,7 +108,7 @@ _DASHBOARD = f"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CF Solver -- {AUTHOR}</title>
+<title>CF Turnstile Bypass -- {AUTHOR}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#07070e;color:#ddd;font-family:'Segoe UI',system-ui,monospace;min-height:100vh}}
@@ -139,7 +139,7 @@ footer{{text-align:center;color:#252535;font-size:.7rem;padding:18px}}
 </head>
 <body>
 <div class="hdr">
-  <h1>CF Solver Dashboard <span class="badge" id="sb">...</span></h1>
+  <h1>CF Turnstile Bypass <span class="badge" id="sb">...</span></h1>
   <div class="sub">By {AUTHOR} &nbsp;|&nbsp; v{VERSION}</div>
 </div>
 <div class="body">
@@ -162,7 +162,7 @@ footer{{text-align:center;color:#252535;font-size:.7rem;padding:18px}}
     </table>
   </div>
 </div>
-<footer>CF Solver | By {AUTHOR}</footer>
+<footer>CF Turnstile Bypass | By {AUTHOR}</footer>
 <script>
 function fmt(s){{if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m'}}
 function load(){{
@@ -271,7 +271,7 @@ class _Handler(BaseHTTPRequestHandler):
 def _banner(public_port: int, solver_port: int) -> None:
     w = 56
     print("=" * w)
-    print(f"  CF Solver  --  By {AUTHOR}")
+    print(f"  CF Turnstile Bypass  --  By {AUTHOR}")
     print(f"  v{VERSION}")
     print("=" * w)
     print(f"  Solver  (i.exe)  : http://127.0.0.1:{solver_port}")
