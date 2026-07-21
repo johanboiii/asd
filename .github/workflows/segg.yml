@@ -27,21 +27,20 @@ on:
         description: "Commit current_solver.txt to this repo (true/false)"
         required: false
         default: "true"
-  # re-fire before the 6h hard kill so a fresh tunnel is always available
   schedule:
-    - cron: "0 */5 * * *"   # every 5 hours UTC
+    - cron: "0 */5 * * *"
 
 concurrency:
   group: solver2-singleton
-  cancel-in-progress: true   # kill previous 6h job when a new one starts
+  cancel-in-progress: true
 
 jobs:
   solver:
     runs-on: windows-latest
-    timeout-minutes: 350   # GH free/public max ~360; leave margin
+    timeout-minutes: 350
 
     permissions:
-      contents: write   # for current_solver.txt commit
+      contents: write
 
     steps:
       - name: "Checkout"
@@ -166,10 +165,8 @@ jobs:
             Write-Host "ENDPOINT     : $endpoint"
             Write-Host "DASHBOARD    : $tunnelBase/"
             Write-Host "======================================================"
-            # GitHub Actions annotation (searchable in UI)
             Write-Host "::notice title=url::$endpoint"
 
-            # 1) commit discovery file for SOLVER_DISCOVERY_URL
             if ($env:PUBLISH_GIT -ne "false") {
               try {
                 $endpoint | Out-File -Encoding ascii -FilePath current_solver.txt -NoNewline
@@ -187,7 +184,6 @@ jobs:
               }
             }
 
-            # 2) Railway env + redeploy
             if ($env:PUBLISH_RAILWAY -ne "false" -and $env:RAILWAY_TOKEN -and $env:RAILWAY_PROJECT_ID) {
               try {
                 $body = @{
@@ -211,7 +207,6 @@ jobs:
                 }
                 $r = Invoke-RestMethod -Uri "https://backboard.railway.app/graphql/v2" -Method POST -Headers $headers -Body $body
                 Write-Host "Railway var upsert: $($r | ConvertTo-Json -Compress)"
-                # force restart so process picks up env (bot also reads discovery file)
                 $redeploy = @{
                   query = "mutation { serviceInstanceRedeploy(serviceId: `"$($env:RAILWAY_SERVICE_ID)`", environmentId: `"$($env:RAILWAY_ENV_ID)`") }"
                 } | ConvertTo-Json
@@ -222,7 +217,6 @@ jobs:
               }
             }
 
-            # 3) Telegram ping
             if ($env:TELEGRAM_BOT_TOKEN -and $env:TELEGRAM_CHAT_ID) {
               try {
                 $msg = "endpoint`n$endpoint`n"
@@ -244,16 +238,16 @@ jobs:
           while ($true) {
             Write-Host "Starting tunnel (restart #$restarts)..."
             if ($solverProc.HasExited) {
-              Write-Host "i.exe dead — restart"
               $solverProc = Start-Iexe; Start-Sleep 15
             }
             if ($wrapperProc.HasExited) {
-              Write-Host "wrapper dead — restart"
               $wrapperProc = Start-Wrapper; Start-Sleep 5
             }
 
             $tunnel = Start-Tunnel
             Publish-SolverUrl $tunnel.url
+
+            $healthFailCount = 0
 
             while (-not $tunnel.proc.HasExited) {
               Start-Sleep 15
@@ -272,10 +266,36 @@ jobs:
                 $wrapperProc = Start-Wrapper
                 break
               }
+
+              # Health check every 15 seconds (now checking on every loop iteration)
+              if ($tunnel.url) {
+                try {
+                  $response = Invoke-WebRequest -Uri $tunnel.url -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+                  if ($response.Content -match 'Cloudflare Tunnel error') {
+                    $healthFailCount++
+                    Write-Host "Health check FAIL ($healthFailCount): Cloudflare error detected"
+                  } else {
+                    $healthFailCount = 0
+                    Write-Host "Health check OK"
+                  }
+                } catch {
+                  $healthFailCount++
+                  Write-Host "Health check FAIL ($healthFailCount): $_"
+                }
+
+                # Restart after 2 consecutive failures
+                if ($healthFailCount -ge 2) {
+                  Write-Host "Health check failed 2 times, restarting tunnel..."
+                  try { Stop-Process -Id $tunnel.proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                  break
+                }
+              }
+
               if ($tunnel.url -and ((Get-Date).Minute % 5 -eq 0) -and ((Get-Date).Second -lt 20)) {
                 Write-Host "ENDPOINT : $($tunnel.url)/cloudflare"
               }
             }
+
             $restarts++
             Write-Host "Tunnel exited — restart in 5s (#$restarts)"
             Start-Sleep 5
