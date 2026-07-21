@@ -1,4 +1,4 @@
-name: "worker"
+name: "claude"
 
 on:
   workflow_dispatch:
@@ -27,9 +27,6 @@ on:
         description: "Commit current_solver.txt to this repo (true/false)"
         required: false
         default: "true"
-  # re-fire before the 6h hard kill so a fresh tunnel is always available
-  schedule:
-    - cron: "0 */5 * * *"   # every 5 hours UTC
 
 concurrency:
   group: solver2-singleton
@@ -173,8 +170,8 @@ jobs:
             if ($env:PUBLISH_GIT -ne "false") {
               try {
                 $endpoint | Out-File -Encoding ascii -FilePath current_solver.txt -NoNewline
-                git config user.name "solver2-bot"
-                git config user.email "solver2@users.noreply.github.com"
+                git config user.name "Claude"
+                git config user.email "noreply@anthropic.com"
                 git add current_solver.txt
                 git diff --cached --quiet
                 if ($LASTEXITCODE -ne 0) {
