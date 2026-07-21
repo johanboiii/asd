@@ -27,20 +27,21 @@ on:
         description: "Commit current_solver.txt to this repo (true/false)"
         required: false
         default: "true"
+  # re-fire before the 6h hard kill so a fresh tunnel is always available
   schedule:
-    - cron: "0 */5 * * *"
+    - cron: "0 */5 * * *"   # every 5 hours UTC
 
 concurrency:
   group: solver2-singleton
-  cancel-in-progress: true
+  cancel-in-progress: true   # kill previous 6h job when a new one starts
 
 jobs:
   solver:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 350   # GH free/public max ~360; leave margin
 
     permissions:
-      contents: write
+      contents: write   # for current_solver.txt commit
 
     steps:
       - name: "Checkout"
@@ -109,7 +110,7 @@ jobs:
             }
           }
 
-      - name: "Run Solver + Tunnel (Zero Trust with Token)"
+      - name: "Run Solver + Tunnel (publish URL on each restart)"
         shell: pwsh
         env:
           INPUT_PORT: ${{ github.event.inputs.PORT || '8742' }}
@@ -122,8 +123,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-          CUSTOM_DOMAIN: "solver.dths.web.id"   # <-- your domain
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
         run: |
@@ -142,19 +141,35 @@ jobs:
             Write-Host "Starting wrapper.py $PORT -> $SOLVER_PORT"
             return (Start-Process python -ArgumentList "wrapper.py", "$PORT", "$SOLVER_PORT" -PassThru -NoNewWindow -RedirectStandardOutput wrapper.log -RedirectStandardError wrapper_err.log)
           }
+          function Start-Tunnel {
+            $logFile = "tunnel_$(Get-Date -Format 'HHmmss').log"
+            $proc = Start-Process ".\cloudflared.exe" -ArgumentList "tunnel","--url","http://localhost:$PORT" -RedirectStandardError $logFile -PassThru -NoNewWindow
+            $url = $null
+            for ($w = 0; $w -lt 45 -and -not $url; $w++) {
+              Start-Sleep 1
+              $c = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+              if ($c -match 'https://[a-z0-9\-]+\.trycloudflare\.com') { $url = $Matches[0] }
+            }
+            return @{ proc = $proc; url = $url; log = $logFile }
+          }
 
-          function Publish-SolverUrl([string]$endpoint) {
-            if (-not $endpoint) { return }
+          function Publish-SolverUrl([string]$tunnelBase) {
+            if (-not $tunnelBase) { return }
+            $endpoint = "$tunnelBase/cloudflare"
             if ($endpoint -eq $script:lastPublished) {
               Write-Host "URL unchanged, skip publish"
               return
             }
             $script:lastPublished = $endpoint
             Write-Host "======================================================"
+            Write-Host "TUNNEL URL   : $tunnelBase"
             Write-Host "ENDPOINT     : $endpoint"
+            Write-Host "DASHBOARD    : $tunnelBase/"
             Write-Host "======================================================"
+            # GitHub Actions annotation (searchable in UI)
             Write-Host "::notice title=url::$endpoint"
 
+            # 1) commit discovery file for SOLVER_DISCOVERY_URL
             if ($env:PUBLISH_GIT -ne "false") {
               try {
                 $endpoint | Out-File -Encoding ascii -FilePath current_solver.txt -NoNewline
@@ -167,9 +182,12 @@ jobs:
                   git push origin HEAD:main 2>&1 | ForEach-Object { Write-Host $_ }
                   Write-Host "Published current_solver.txt"
                 }
-              } catch { Write-Host "WARN git publish failed: $_" }
+              } catch {
+                Write-Host "WARN git publish failed: $_"
+              }
             }
 
+            # 2) Railway env + redeploy
             if ($env:PUBLISH_RAILWAY -ne "false" -and $env:RAILWAY_TOKEN -and $env:RAILWAY_PROJECT_ID) {
               try {
                 $body = @{
@@ -180,7 +198,9 @@ jobs:
                       environmentId = $env:RAILWAY_ENV_ID
                       serviceId = $env:RAILWAY_SERVICE_ID
                       skipDeploys = $false
-                      variables = @{ TURNSTILE_SOLVER = $endpoint }
+                      variables = @{
+                        TURNSTILE_SOLVER = $endpoint
+                      }
                     }
                   }
                 } | ConvertTo-Json -Depth 8
@@ -191,24 +211,29 @@ jobs:
                 }
                 $r = Invoke-RestMethod -Uri "https://backboard.railway.app/graphql/v2" -Method POST -Headers $headers -Body $body
                 Write-Host "Railway var upsert: $($r | ConvertTo-Json -Compress)"
+                # force restart so process picks up env (bot also reads discovery file)
                 $redeploy = @{
                   query = "mutation { serviceInstanceRedeploy(serviceId: `"$($env:RAILWAY_SERVICE_ID)`", environmentId: `"$($env:RAILWAY_ENV_ID)`") }"
                 } | ConvertTo-Json
                 $r2 = Invoke-RestMethod -Uri "https://backboard.railway.app/graphql/v2" -Method POST -Headers $headers -Body $redeploy
                 Write-Host "Railway redeploy: $($r2 | ConvertTo-Json -Compress)"
-              } catch { Write-Host "WARN Railway publish failed: $_" }
+              } catch {
+                Write-Host "WARN Railway publish failed: $_"
+              }
             }
 
+            # 3) Telegram ping
             if ($env:TELEGRAM_BOT_TOKEN -and $env:TELEGRAM_CHAT_ID) {
               try {
                 $msg = "endpoint`n$endpoint`n"
                 $tg = "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage"
                 Invoke-RestMethod -Uri $tg -Method POST -Body @{ chat_id = $env:TELEGRAM_CHAT_ID; text = $msg } | Out-Null
-              } catch { Write-Host "WARN telegram notify failed: $_" }
+              } catch {
+                Write-Host "WARN telegram notify failed: $_"
+              }
             }
           }
 
-          # Start solver and wrapper
           $solverProc = Start-Iexe
           Write-Host "Waiting 15s for i.exe..."
           Start-Sleep 15
@@ -216,64 +241,41 @@ jobs:
           $wrapperProc = Start-Wrapper
           Start-Sleep 5
 
-          $endpointUrl = "https://$($env:CUSTOM_DOMAIN)/cloudflare"
-          Publish-SolverUrl $endpointUrl
-
           while ($true) {
-            Write-Host "Starting Zero Trust tunnel (restart #$restarts)..."
-            if ($solverProc.HasExited) { $solverProc = Start-Iexe; Start-Sleep 15 }
-            if ($wrapperProc.HasExited) { $wrapperProc = Start-Wrapper; Start-Sleep 5 }
+            Write-Host "Starting tunnel (restart #$restarts)..."
+            if ($solverProc.HasExited) {
+              Write-Host "i.exe dead — restart"
+              $solverProc = Start-Iexe; Start-Sleep 15
+            }
+            if ($wrapperProc.HasExited) {
+              Write-Host "wrapper dead — restart"
+              $wrapperProc = Start-Wrapper; Start-Sleep 5
+            }
 
-            # --- FIXED: run cloudflared with token quoted via cmd.exe ---
-            $tunnelProc = Start-Process cmd.exe -ArgumentList "/c", ".\cloudflared.exe tunnel run --token `"$env:CLOUDFLARE_TUNNEL_TOKEN`"" -PassThru -NoNewWindow -RedirectStandardOutput tunnel.log -RedirectStandardError tunnel_err.log
+            $tunnel = Start-Tunnel
+            Publish-SolverUrl $tunnel.url
 
-            $healthFailCount = 0
-
-            while (-not $tunnelProc.HasExited) {
+            while (-not $tunnel.proc.HasExited) {
               Start-Sleep 15
               $ts = Get-Date -Format "HH:mm:ss"
-              Write-Host "$ts | tunnel=$(-not $tunnelProc.HasExited) | i.exe=$(-not $solverProc.HasExited) | wrapper=$(-not $wrapperProc.HasExited)"
+              Write-Host "$ts | tunnel=$(-not $tunnel.proc.HasExited) | i.exe=$(-not $solverProc.HasExited) | wrapper=$(-not $wrapperProc.HasExited)"
 
               if ($solverProc.HasExited) {
-                try { Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                try { Stop-Process -Id $tunnel.proc.Id -Force -ErrorAction SilentlyContinue } catch {}
                 try { Stop-Process -Id $wrapperProc.Id -Force -ErrorAction SilentlyContinue } catch {}
                 $solverProc = Start-Iexe; Start-Sleep 15
                 $wrapperProc = Start-Wrapper
                 break
               }
               if ($wrapperProc.HasExited) {
-                try { Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                try { Stop-Process -Id $tunnel.proc.Id -Force -ErrorAction SilentlyContinue } catch {}
                 $wrapperProc = Start-Wrapper
                 break
               }
-
-              # Health check on root path (not /cloudflare)
-              try {
-                $healthUrl = "https://$($env:CUSTOM_DOMAIN)/"
-                $response = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                if ($response.Content -match 'Cloudflare Tunnel error|error code: 1016|Origin DNS error|502 Bad Gateway') {
-                  $healthFailCount++
-                  Write-Host "Health check FAIL ($healthFailCount): Cloudflare error detected"
-                } else {
-                  $healthFailCount = 0
-                  Write-Host "Health check OK (status $($response.StatusCode))"
-                }
-              } catch {
-                $healthFailCount++
-                Write-Host "Health check FAIL ($healthFailCount): $_"
-              }
-
-              if ($healthFailCount -ge 2) {
-                Write-Host "Health check failed 2 times, restarting tunnel..."
-                try { Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue } catch {}
-                break
-              }
-
-              if ((Get-Date).Minute % 5 -eq 0 -and (Get-Date).Second -lt 20) {
-                Write-Host "ENDPOINT : $endpointUrl"
+              if ($tunnel.url -and ((Get-Date).Minute % 5 -eq 0) -and ((Get-Date).Second -lt 20)) {
+                Write-Host "ENDPOINT : $($tunnel.url)/cloudflare"
               }
             }
-
             $restarts++
             Write-Host "Tunnel exited — restart in 5s (#$restarts)"
             Start-Sleep 5
