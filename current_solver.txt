@@ -1,1 +1,1 @@
-https://magnetic-golf-adrian-visiting.trycloudflare.com/cloudflare
+https://api.trycloudflare.com/cloudflare
