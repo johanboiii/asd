@@ -1,1 +1,1 @@
-https://api.trycloudflare.com/cloudflare
+https://language-inter-with-lip.trycloudflare.com/cloudflare
