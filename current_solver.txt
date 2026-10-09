@@ -1,1 +1,1 @@
-https://had-gabriel-well-mathematical.trycloudflare.com/cloudflare
+https://api.trycloudflare.com/cloudflare
